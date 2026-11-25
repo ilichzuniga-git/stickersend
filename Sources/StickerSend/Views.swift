@@ -388,8 +388,8 @@ struct LibraryRow: View {
             .help(count > 0 ? "\(count) on sheet — click to add another copy" : "Add to sheet")
         }
         .padding(.vertical, 2)
-        // Drag a sticker onto the sheet to place it exactly there.
-        .onDrag { NSItemProvider(object: sticker.url as NSURL) }
+        // Native Transferable drag: integrates with NSTableView without adding click delay.
+        .draggable(sticker.url)
     }
 }
 
@@ -397,7 +397,6 @@ struct LibraryRow: View {
 
 struct StickerCheckInspector: View {
     @EnvironmentObject var model: AppModel
-    @State private var largeImage: NSImage?
     @State private var showPassingDetails = false
 
     /// Prefer the currently selected canvas sticker if no library selection overrides it,
@@ -417,10 +416,10 @@ struct StickerCheckInspector: View {
         if let sticker {
             let count = model.sheetCount(for: sticker)
             VStack(alignment: .leading, spacing: 14) {
-                // Dark-blue (#3366aa) border preview
+                // Dark-blue (#3366aa) border preview — uses cached 900px canvasImage directly (0 ms)
                 ZStack(alignment: .bottomTrailing) {
                     RoundedRectangle(cornerRadius: 10).fill(darkCheck)
-                    if let img = largeImage ?? model.thumbnails[sticker.url] {
+                    if let img = model.canvasImages[sticker.url] ?? model.thumbnails[sticker.url] {
                         Image(nsImage: img)
                             .resizable()
                             .interpolation(.high)
@@ -542,11 +541,8 @@ struct StickerCheckInspector: View {
                     }
                 }
             }
-            .task(id: sticker.url) {
-                largeImage = nil
+            .onChange(of: sticker.url) { _ in
                 showPassingDetails = false
-                let url = sticker.url
-                largeImage = await Task.detached { AppModel.thumbnail(url: url, maxPixel: 1000) }.value
             }
         } else {
             VStack(spacing: 8) {
@@ -663,7 +659,8 @@ func loadFileURLs(_ providers: [NSItemProvider], completion: @escaping @MainActo
     let group = DispatchGroup()
     var urls = [URL?](repeating: nil, count: providers.count)
     let lock = NSLock()
-    for (i, provider) in providers.enumerated() where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+    for (i, provider) in providers.enumerated()
+    where provider.canLoadObject(ofClass: URL.self) || provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
         group.enter()
         _ = provider.loadObject(ofClass: URL.self) { url, _ in
             lock.lock(); urls[i] = url; lock.unlock()
@@ -671,7 +668,7 @@ func loadFileURLs(_ providers: [NSItemProvider], completion: @escaping @MainActo
         }
     }
     group.notify(queue: .main) {
-        let found = urls.compactMap { $0 }
+        let found = urls.compactMap { $0 }.filter(\.isFileURL)
         MainActor.assumeIsolated { completion(found) }
     }
 }

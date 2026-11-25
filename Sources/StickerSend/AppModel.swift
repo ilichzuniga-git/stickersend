@@ -66,19 +66,27 @@ final class AppModel: ObservableObject {
     @Published var doc = SheetDocument() {
         didSet {
             if doc != oldValue { invalidateSheet() }
-            if doc.items != oldValue.items { recomputeOverlaps() }
+            if doc.items != oldValue.items {
+                if suppressAsyncOverlaps {
+                    recomputeOverlapsSync()
+                } else {
+                    scheduleRecomputeOverlaps()
+                }
+            }
         }
     }
+    private var suppressAsyncOverlaps = false
     @Published private(set) var docURL: URL?
     @Published private var savedDoc = SheetDocument()
     @Published var savedSheets: [URL] = []
     @Published var selectedItem: PlacedItem.ID? {
         didSet {
+            guard selectedItem != oldValue else { return }
             if let id = selectedItem, let item = doc.items.first(where: { $0.id == id }) {
-                if stickers.contains(where: { $0.url == item.url }) {
+                if selection != item.url, stickers.contains(where: { $0.url == item.url }) {
                     selection = item.url
                 }
-                inspectorTab = .selected
+                if inspectorTab != .selected { inspectorTab = .selected }
             } else if selectedItem == nil && inspectorTab == .selected {
                 inspectorTab = .sheet
             }
@@ -125,8 +133,8 @@ final class AppModel: ObservableObject {
 
     /// Select a sticker in the library and open its dark-blue Check view.
     func inspectLibrarySticker(_ sticker: Sticker) {
-        selection = sticker.id
-        inspectorTab = .check
+        if selection != sticker.id { selection = sticker.id }
+        if inspectorTab != .check { inspectorTab = .check }
     }
 
     /// Switch Arrange / Cut Preview; auto-builds cut preview when entering Preview with no fresh build.
@@ -251,33 +259,41 @@ final class AppModel: ObservableObject {
         analyse(stickers.map(\.url))
     }
 
-    /// Check and thumbnail any images we have not seen yet (library or sheet).
+    /// Check, thumbnail, and precompute silhouettes/hulls off the main thread.
     private func analyse(_ urls: [URL]) {
         for url in urls where reports[url] == nil {
             Task.detached(priority: .userInitiated) {
                 let report = StickerCheck.run(url: url)
-                let thumb = Self.thumbnail(url: url, maxPixel: 256)
-                let large = Self.thumbnail(url: url, maxPixel: 900)
+                let thumbCG = Self.thumbnailCG(url: url, maxPixel: 256)
+                let largeCG = Self.thumbnailCG(url: url, maxPixel: 900)
+                let field = largeCG.flatMap { Self.computeSilhouette(cg: $0) }
+                let hull = field.flatMap { Self.computeHull(from: $0) }
                 await MainActor.run {
                     self.reports[url] = report
-                    if let thumb { self.thumbnails[url] = thumb }
-                    if let large {
-                        self.canvasImages[url] = large
-                        self.silhouettes[url] = nil
-                        self.hulls[url] = nil
-                        if self.doc.items.contains(where: { $0.url == url }) { self.recomputeOverlaps() }
+                    if let thumbCG {
+                        self.thumbnails[url] = NSImage(cgImage: thumbCG, size: NSSize(width: thumbCG.width, height: thumbCG.height))
+                    }
+                    if let largeCG {
+                        self.canvasImages[url] = NSImage(cgImage: largeCG, size: NSSize(width: largeCG.width, height: largeCG.height))
+                        self.silhouettes[url] = field
+                        self.hulls[url] = hull
+                        if self.doc.items.contains(where: { $0.url == url }) { self.scheduleRecomputeOverlaps() }
                     }
                 }
             }
         }
     }
 
+    nonisolated static func thumbnailCG(url: URL, maxPixel: Int) -> CGImage? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        return CGImageSourceCreateThumbnailAtIndex(src, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+        ] as CFDictionary)
+    }
+
     nonisolated static func thumbnail(url: URL, maxPixel: Int) -> NSImage? {
-        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
-                  kCGImageSourceCreateThumbnailFromImageAlways: true,
-                  kCGImageSourceThumbnailMaxPixelSize: maxPixel,
-              ] as CFDictionary) else { return nil }
+        guard let cg = thumbnailCG(url: url, maxPixel: maxPixel) else { return nil }
         return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
     }
 
@@ -466,7 +482,8 @@ final class AppModel: ObservableObject {
         guard let i = doc.items.firstIndex(where: { $0.id == id }) else { return }
         var item = doc.items[i]
         item.x = origin.x; item.y = origin.y
-        doc.items[i] = clamped(item)
+        let updated = clamped(item)
+        if updated != doc.items[i] { doc.items[i] = updated }
     }
 
     /// Resize about the centre, keeping aspect ratio, kept on the sheet.
@@ -478,7 +495,8 @@ final class AppModel: ObservableObject {
         item.width = max(width, 8)
         item.height = item.width / aspect
         item.center = c
-        doc.items[i] = clamped(item)
+        let updated = clamped(item)
+        if updated != doc.items[i] { doc.items[i] = updated }
     }
 
     /// Set the clockwise rotation in degrees, turning about the centre.
@@ -486,7 +504,8 @@ final class AppModel: ObservableObject {
         guard let i = doc.items.firstIndex(where: { $0.id == id }) else { return }
         var item = doc.items[i]
         item.angle = degrees
-        doc.items[i] = clamped(item)
+        let updated = clamped(item)
+        if updated != doc.items[i] { doc.items[i] = updated }
     }
 
     func rotate(_ id: PlacedItem.ID, by degrees: Double) {
@@ -557,7 +576,12 @@ final class AppModel: ObservableObject {
     /// rotated hull, so this is exact for `extent` at any angle.
     private func hull(for url: URL) -> [CGPoint]? {
         if let h = hulls[url] { return h }
-        guard let f = silhouette(for: url) else { return nil }
+        guard let f = silhouette(for: url), let computed = Self.computeHull(from: f) else { return nil }
+        hulls[url] = computed
+        return computed
+    }
+
+    nonisolated static func computeHull(from f: SilhouetteField) -> [CGPoint]? {
         var pts: [CGPoint] = []
         func solid(_ x: Int, _ y: Int) -> Bool {
             x >= 0 && x < f.width && y >= 0 && y < f.height && f.distance[y * f.width + x] == 0
@@ -585,16 +609,15 @@ final class AppModel: ObservableObject {
             while upper.count >= 2 && cross(upper[upper.count - 2], upper[upper.count - 1], p) <= 0 { upper.removeLast() }
             upper.append(p)
         }
-        let hull = Array(lower.dropLast() + upper.dropLast())
-        hulls[url] = hull
-        return hull
+        return Array(lower.dropLast() + upper.dropLast())
     }
 
-    /// Load a sheet and its images synchronously (for `--overlaps`).
+    /// Load a sheet and its images synchronously (for `--overlaps` / `--pack-test`).
     func loadForTesting(_ url: URL) {
         guard let data = try? Data(contentsOf: url),
               let loaded = try? JSONDecoder().decode(SheetDocument.self, from: data) else { return }
         for item in loaded.items { canvasImages[item.url] = Self.thumbnail(url: item.url, maxPixel: 900) }
+        suppressAsyncOverlaps = true
         doc = loaded
     }
 
@@ -603,13 +626,14 @@ final class AppModel: ObservableObject {
     /// A sticker's silhouette as a distance field: for each pixel of a small
     /// copy of the image, the distance (in those pixels) to the nearest pixel
     /// the cutter treats as solid (alpha > 128). 0 inside the sticker.
-    struct SilhouetteField {
+    struct SilhouetteField: Sendable {
         let width: Int
         let height: Int
         let distance: [Float]
     }
 
     private var silhouettes: [URL: SilhouetteField] = [:]
+    private var overlapTask: Task<Void, Never>?
 
     /// Items whose cut lines touch or cross another sticker's.
     @Published private(set) var overlapping: Set<PlacedItem.ID> = []
@@ -624,7 +648,13 @@ final class AppModel: ObservableObject {
     private func silhouette(for url: URL) -> SilhouetteField? {
         if let f = silhouettes[url] { return f }
         guard let ns = canvasImages[url],
-              let cg = ns.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+              let cg = ns.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let field = Self.computeSilhouette(cg: cg) else { return nil }
+        silhouettes[url] = field
+        return field
+    }
+
+    nonisolated static func computeSilhouette(cg: CGImage) -> SilhouetteField? {
         let scale = min(1, 256 / Double(max(cg.width, cg.height)))
         let w = max(1, Int(Double(cg.width) * scale)), h = max(1, Int(Double(cg.height) * scale))
         var px = [UInt8](repeating: 0, count: w * h * 4)
@@ -635,38 +665,77 @@ final class AppModel: ObservableObject {
         ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
         // Bitmap rows are top-down, matching the image (see SheetBuilder.silhouette).
         let d2 = OutlineRenderer.squaredDistanceToOpaque(px: px, w: w, h: h)
-        let field = SilhouetteField(width: w, height: h, distance: d2.map { Float($0.squareRoot()) })
-        silhouettes[url] = field
-        return field
+        return SilhouetteField(width: w, height: h, distance: d2.map { Float($0.squareRoot()) })
+    }
+
+    /// Recompute overlaps asynchronously off the main thread so dragging or
+    /// clicking stickers stays responsive.
+    func scheduleRecomputeOverlaps() {
+        overlapTask?.cancel()
+        let items = doc.items
+        if items.count < 2 {
+            if !overlapping.isEmpty { overlapping = [] }
+            if overlapImage != nil { overlapImage = nil }
+            return
+        }
+        let inputs = items.map { item in
+            (item: item, field: silhouettes[item.url], extent: extent(item))
+        }
+        overlapTask = Task.detached(priority: .userInitiated) {
+            let (ids, cg) = Self.computeOverlaps(inputs)
+            if Task.isCancelled { return }
+            await MainActor.run {
+                if Task.isCancelled { return }
+                self.overlapping = ids
+                self.overlapImage = cg.map { NSImage(cgImage: $0, size: NSSize(width: $0.width, height: $0.height)) }
+            }
+        }
+    }
+
+    /// Synchronous overlap check used by headless CLI test hooks (`--overlaps`).
+    func recomputeOverlapsSync() {
+        overlapTask?.cancel()
+        let items = doc.items
+        if items.count < 2 {
+            overlapping = []
+            overlapImage = nil
+            return
+        }
+        let inputs = items.map { item in
+            (item: item, field: silhouette(for: item.url), extent: extent(item))
+        }
+        let (ids, cg) = Self.computeOverlaps(inputs)
+        overlapping = ids
+        overlapImage = cg.map { NSImage(cgImage: $0, size: NSSize(width: $0.width, height: $0.height)) }
     }
 
     /// Paint every sticker's cut area (silhouette + outline + half the
     /// clearance) onto a 0.25 mm grid of the sheet; cells claimed by two
-    /// stickers are collisions. This follows the real shapes, so stickers
-    /// whose boxes overlap but whose outlines don't are fine.
-    func recomputeOverlaps() {
+    /// stickers are collisions.
+    nonisolated private static func computeOverlaps(
+        _ inputs: [(item: PlacedItem, field: SilhouetteField?, extent: CGRect)]
+    ) -> (Set<PlacedItem.ID>, CGImage?) {
         let cell = Self.overlapCellMM
         let gw = Int(SheetGeometry.width / cell), gh = Int(SheetGeometry.height / cell)
         var owner = [Int32](repeating: -1, count: gw * gh)
         var clash = [Bool](repeating: false, count: gw * gh)
         var ids = Set<PlacedItem.ID>()
-        let items = doc.items
         let half = Self.cutClearanceMM / 2
 
-        for (index, item) in items.enumerated() {
-            let field = silhouette(for: item.url)
+        for (index, entry) in inputs.enumerated() {
+            let item = entry.item
+            let field = entry.field
             let reach = item.outlineMM + half
             let a = -item.angle * .pi / 180           // inverse rotation
             let c = item.center
             let cosA = cos(a), sinA = sin(a)
-            let b = extent(item).insetBy(dx: -half, dy: -half)
+            let b = entry.extent.insetBy(dx: -half, dy: -half)
             let x0 = max(0, Int(b.minX / cell)), x1 = min(gw - 1, Int(b.maxX / cell))
             let y0 = max(0, Int(b.minY / cell)), y1 = min(gh - 1, Int(b.maxY / cell))
             guard x0 <= x1, y0 <= y1 else { continue }
 
             for gy in y0...y1 {
                 for gx in x0...x1 {
-                    // Cell centre -> the sticker's unrotated frame.
                     let px = (Double(gx) + 0.5) * cell - c.x, py = (Double(gy) + 0.5) * cell - c.y
                     let lx = c.x + px * cosA - py * sinA, ly = c.y + px * sinA + py * cosA
                     let inside: Bool
@@ -674,12 +743,10 @@ final class AppModel: ObservableObject {
                         let mmX = item.width / Double(f.width), mmY = item.height / Double(f.height)
                         let u = (lx - item.x) / mmX, v = (ly - item.y) / mmY
                         let cu = min(max(u, 0), Double(f.width - 1)), cv = min(max(v, 0), Double(f.height - 1))
-                        // Beyond the image edge, add the distance to that edge.
                         let outside = hypot((u - cu) * mmX, (v - cv) * mmY)
                         let d = Double(f.distance[Int(cv) * f.width + Int(cu)]) * mmX + outside
                         inside = d <= reach
                     } else {
-                        // Image not loaded yet: fall back to the frame.
                         inside = item.outerRect.insetBy(dx: -half, dy: -half).contains(CGPoint(x: lx, y: ly))
                     }
                     guard inside else { continue }
@@ -688,7 +755,7 @@ final class AppModel: ObservableObject {
                     if prev >= 0 && Int(prev) != index {
                         clash[k] = true
                         ids.insert(item.id)
-                        ids.insert(items[Int(prev)].id)
+                        ids.insert(inputs[Int(prev)].item.id)
                     } else {
                         owner[k] = Int32(index)
                     }
@@ -696,20 +763,18 @@ final class AppModel: ObservableObject {
             }
         }
 
-        overlapping = ids
-        overlapImage = ids.isEmpty ? nil : Self.overlayImage(clash, gw: gw, gh: gh)
+        return (ids, ids.isEmpty ? nil : Self.overlayCGImage(clash, gw: gw, gh: gh))
     }
 
-    private static func overlayImage(_ clash: [Bool], gw: Int, gh: Int) -> NSImage? {
+    nonisolated private static func overlayCGImage(_ clash: [Bool], gw: Int, gh: Int) -> CGImage? {
         var px = [UInt8](repeating: 0, count: gw * gh * 4)
         for i in 0..<(gw * gh) where clash[i] {
             px[i * 4] = 235; px[i * 4 + 1] = 20; px[i * 4 + 2] = 40; px[i * 4 + 3] = 235
         }
         guard let ctx = CGContext(data: &px, width: gw, height: gh, bitsPerComponent: 8, bytesPerRow: gw * 4,
                                   space: CGColorSpaceCreateDeviceRGB(),
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
-              let cg = ctx.makeImage() else { return nil }
-        return NSImage(cgImage: cg, size: NSSize(width: gw, height: gh))
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        return ctx.makeImage()
     }
 
     // MARK: Arranging and filling

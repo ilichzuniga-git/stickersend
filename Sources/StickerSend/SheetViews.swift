@@ -943,6 +943,7 @@ struct SheetCanvas: View {
     @EnvironmentObject var model: AppModel
     /// The item as it was when a gesture began, so gestures are relative to it.
     @State private var gestureStart: PlacedItem?
+    @State private var didMoveDuringDrag = false
     @State private var dropTargeted = false
 
     var body: some View {
@@ -1057,14 +1058,24 @@ struct SheetCanvas: View {
                             .onChanged { g in
                                 if gestureStart == nil {
                                     gestureStart = item
-                                    model.selectedItem = item.id
-                                    model.recordUndo()
+                                    didMoveDuringDrag = false
+                                    if model.selectedItem != item.id {
+                                        model.selectedItem = item.id
+                                    }
                                 }
                                 guard let start = gestureStart else { return }
+                                if !didMoveDuringDrag {
+                                    guard hypot(g.translation.width, g.translation.height) > 1.5 else { return }
+                                    didMoveDuringDrag = true
+                                    model.recordUndo()
+                                }
                                 model.move(item.id, to: CGPoint(x: start.x + g.translation.width / s,
                                                                 y: start.y + g.translation.height / s))
                             }
-                            .onEnded { _ in gestureStart = nil }
+                            .onEnded { _ in
+                                gestureStart = nil
+                                didMoveDuringDrag = false
+                            }
                     )
                 }
 
@@ -1147,7 +1158,7 @@ struct SheetCanvas: View {
             .coordinateSpace(name: "canvas")
             // Drop PNGs from Finder, or stickers from the library, to place
             // them right where they land.
-            .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers, location in
+            .onDrop(of: [.fileURL, .url], isTargeted: $dropTargeted) { providers, location in
                 let mm = CGPoint(x: (location.x - origin.x) / s + paper.minX,
                                  y: (location.y - origin.y) / s + paper.minY)
                 loadFileURLs(providers) { model.dropOnSheet($0, at: mm) }
@@ -1172,22 +1183,25 @@ struct SheetCanvas: View {
     }
 }
 
-/// The usual "transparent" checkerboard.
+/// GPU-tiled transparent checkerboard (cached once as a 16×16 tile).
 struct Checkerboard: View {
-    var square: CGFloat = 8
+    private static let tile: NSImage = {
+        let s = 8
+        let size = s * 2
+        let img = NSImage(size: NSSize(width: size, height: size))
+        img.lockFocus()
+        NSColor.white.setFill()
+        NSRect(x: 0, y: 0, width: size, height: size).fill()
+        NSColor(white: 0.85, alpha: 1).setFill()
+        NSRect(x: s, y: 0, width: s, height: s).fill()
+        NSRect(x: 0, y: s, width: s, height: s).fill()
+        img.unlockFocus()
+        return img
+    }()
 
     var body: some View {
-        Canvas { ctx, size in
-            ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(.white))
-            let cols = Int((size.width / square).rounded(.up)), rows = Int((size.height / square).rounded(.up))
-            var dark = Path()
-            for r in 0..<rows {
-                for c in 0..<cols where (r + c) % 2 == 1 {
-                    dark.addRect(CGRect(x: CGFloat(c) * square, y: CGFloat(r) * square, width: square, height: square))
-                }
-            }
-            ctx.fill(dark, with: .color(Color(white: 0.85)))
-        }
+        Image(nsImage: Self.tile)
+            .resizable(resizingMode: .tile)
     }
 }
 
