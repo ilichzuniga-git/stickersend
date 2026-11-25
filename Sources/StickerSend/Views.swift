@@ -243,20 +243,48 @@ struct LibraryView: View {
     }
 
     var body: some View {
-        let listSelection = Binding<Sticker.ID?>(
-            get: { model.selection },
-            set: { newID in
-                guard let newID, let sticker = model.stickers.first(where: { $0.id == newID }) else { return }
-                model.inspectLibrarySticker(sticker)
-            }
-        )
-
         VStack(spacing: 0) {
-            List(selection: listSelection) {
-                Section {
+            // Compact search field
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("Filter stickers", text: $filter)
+                    .textFieldStyle(.plain)
+                    .font(.callout)
+                if !filter.isEmpty {
+                    Button { filter = "" } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(Color(nsColor: .textBackgroundColor).opacity(0.75), in: RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.08), lineWidth: 1))
+            .padding(.horizontal, 10)
+            .padding(.top, 10)
+            .padding(.bottom, 6)
+
+            HStack {
+                Text("Stickers")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(filtered.count)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 4)
+
+            ScrollView {
+                LazyVStack(spacing: 2) {
                     ForEach(filtered) { sticker in
-                        LibraryRow(sticker: sticker)
-                            .tag(sticker.id)
+                        LibraryRow(sticker: sticker, isSelected: model.selection == sticker.id)
                             .contextMenu {
                                 Button("Add to Sheet") { model.add(sticker.url) }
                                 if model.isOnSheet(sticker) {
@@ -269,18 +297,10 @@ struct LibraryView: View {
                                 Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([sticker.url]) }
                             }
                     }
-                } header: {
-                    HStack {
-                        Text("Stickers")
-                        Spacer()
-                        Text("\(filtered.count)")
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.tertiary)
-                    }
                 }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 8)
             }
-            .listStyle(.sidebar)
-            .searchable(text: $filter, placement: .sidebar, prompt: "Filter stickers")
             // Drop PNGs from Finder to copy them into the sticker folder.
             .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
                 loadFileURLs(providers) { model.importFiles($0) }
@@ -346,6 +366,7 @@ struct LibraryView: View {
 struct LibraryRow: View {
     @EnvironmentObject var model: AppModel
     let sticker: Sticker
+    let isSelected: Bool
 
     var body: some View {
         let count = model.sheetCount(for: sticker)
@@ -387,9 +408,18 @@ struct LibraryRow: View {
             .buttonStyle(.plain)
             .help(count > 0 ? "\(count) on sheet — click to add another copy" : "Add to sheet")
         }
-        .padding(.vertical, 2)
-        // Native Transferable drag: integrates with NSTableView without adding click delay.
-        .draggable(sticker.url)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(
+            RoundedRectangle(cornerRadius: 7)
+                .fill(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            model.inspectLibrarySticker(sticker)
+        }
+        // Drag a sticker onto the sheet to place it right where you drop it.
+        .onDrag { NSItemProvider(object: sticker.url as NSURL) }
     }
 }
 
@@ -660,15 +690,32 @@ func loadFileURLs(_ providers: [NSItemProvider], completion: @escaping @MainActo
     var urls = [URL?](repeating: nil, count: providers.count)
     let lock = NSLock()
     for (i, provider) in providers.enumerated()
-    where provider.canLoadObject(ofClass: URL.self) || provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+    where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
         group.enter()
         _ = provider.loadObject(ofClass: URL.self) { url, _ in
-            lock.lock(); urls[i] = url; lock.unlock()
-            group.leave()
+            if let url {
+                lock.lock(); urls[i] = url; lock.unlock()
+                group.leave()
+            } else {
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    let resolved: URL?
+                    if let data = item as? Data {
+                        resolved = URL(dataRepresentation: data, relativeTo: nil)
+                    } else if let u = item as? URL {
+                        resolved = u
+                    } else if let s = item as? String {
+                        resolved = URL(string: s)
+                    } else {
+                        resolved = nil
+                    }
+                    lock.lock(); urls[i] = resolved; lock.unlock()
+                    group.leave()
+                }
+            }
         }
     }
     group.notify(queue: .main) {
-        let found = urls.compactMap { $0 }.filter(\.isFileURL)
+        let found = urls.compactMap { $0 }
         MainActor.assumeIsolated { completion(found) }
     }
 }

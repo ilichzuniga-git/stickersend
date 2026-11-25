@@ -1158,7 +1158,7 @@ struct SheetCanvas: View {
             .coordinateSpace(name: "canvas")
             // Drop PNGs from Finder, or stickers from the library, to place
             // them right where they land.
-            .onDrop(of: [.fileURL, .url], isTargeted: $dropTargeted) { providers, location in
+            .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers, location in
                 let mm = CGPoint(x: (location.x - origin.x) / s + paper.minX,
                                  y: (location.y - origin.y) / s + paper.minY)
                 loadFileURLs(providers) { model.dropOnSheet($0, at: mm) }

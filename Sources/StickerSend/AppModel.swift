@@ -642,8 +642,8 @@ final class AppModel: ObservableObject {
 
     /// Cut lines closer than this are flagged too: the blade would leave a
     /// sliver too thin to peel.
-    static let cutClearanceMM = 0.5
-    private static let overlapCellMM = 0.25
+    nonisolated static let cutClearanceMM = 0.5
+    nonisolated private static let overlapCellMM = 0.25
 
     private func silhouette(for url: URL) -> SilhouetteField? {
         if let f = silhouettes[url] { return f }
