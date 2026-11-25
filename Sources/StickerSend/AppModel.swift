@@ -38,12 +38,19 @@ final class AppModel: ObservableObject {
 
     // MARK: Settings
 
-    @AppStorage("libraryPath") private var libraryPath =
-        (NSHomeDirectory() as NSString).appendingPathComponent("Documents/stickers/Finalized Stickers")
-    @AppStorage("sheetsPath") private var sheetsPath =
-        (NSHomeDirectory() as NSString).appendingPathComponent("Documents/stickers/Sheets")
+    static let defaultLibraryPath =
+        (NSHomeDirectory() as NSString).appendingPathComponent("Documents/StickerSend/Stickers")
+    static let defaultSheetsPath =
+        (NSHomeDirectory() as NSString).appendingPathComponent("Documents/StickerSend/Sheets")
+
+    @AppStorage("hasCompletedSetup") var hasCompletedSetup = false
+    @AppStorage("libraryPath") var libraryPath = AppModel.defaultLibraryPath
+    @AppStorage("sheetsPath") private var sheetsPath = AppModel.defaultSheetsPath
     @AppStorage("printerAddress") var printerAddress = ""
     @AppStorage("cliPath") var cliPath = ""
+
+    /// Shown on first launch until the user picks or confirms their sticker folder.
+    @Published var showWelcomeSetup = false
 
     // MARK: Library
 
@@ -170,22 +177,63 @@ final class AppModel: ObservableObject {
     }
 
     init() {
+        let legacyPath = (NSHomeDirectory() as NSString)
+            .appendingPathComponent("Documents/stickers/Finalized Stickers")
+        if !hasCompletedSetup {
+            if UserDefaults.standard.string(forKey: "libraryPath") != nil {
+                hasCompletedSetup = true
+            } else {
+                // Pre-suggest legacy folder if it already exists on this Mac,
+                // while still letting the user confirm or pick a folder on first run.
+                if FileManager.default.fileExists(atPath: legacyPath) {
+                    libraryPath = legacyPath
+                    let legacySheets = (NSHomeDirectory() as NSString)
+                        .appendingPathComponent("Documents/stickers/Sheets")
+                    if FileManager.default.fileExists(atPath: legacySheets) {
+                        sheetsPath = legacySheets
+                    }
+                }
+                showWelcomeSetup = true
+            }
+        }
         reload()
         refreshSavedSheets()
     }
 
     // MARK: Library actions
 
-    func chooseFolder() {
+    /// Complete initial setup using the current (or newly chosen) sticker folder.
+    func completeSetup(useDefault: Bool = false) {
+        if useDefault {
+            try? FileManager.default.createDirectory(at: libraryURL, withIntermediateDirectories: true)
+            hasCompletedSetup = true
+            showWelcomeSetup = false
+            reload()
+        } else if chooseFolder() {
+            hasCompletedSetup = true
+            showWelcomeSetup = false
+        }
+    }
+
+    @discardableResult
+    func chooseFolder() -> Bool {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
-        panel.directoryURL = libraryURL
+        panel.canCreateDirectories = true
+        if FileManager.default.fileExists(atPath: libraryURL.path) {
+            panel.directoryURL = libraryURL
+        } else {
+            panel.directoryURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        }
         panel.prompt = "Use Folder"
         if panel.runModal() == .OK, let url = panel.url {
             libraryPath = url.path
+            hasCompletedSetup = true
             reload()
+            return true
         }
+        return false
     }
 
     func reload() {
@@ -318,6 +366,7 @@ final class AppModel: ObservableObject {
         -> (urls: [URL], copied: Bool, messages: [(String, Bool)]) {
         let fm = FileManager.default
         let library = library.standardizedFileURL
+        try? fm.createDirectory(at: library, withIntermediateDirectories: true)
         var result: [URL] = []
         var messages: [(String, Bool)] = []
         var copied = false
@@ -857,7 +906,7 @@ final class AppModel: ObservableObject {
     func chooseBackgroundImage() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.image]
-        panel.directoryURL = URL(fileURLWithPath: (NSHomeDirectory() as NSString).appendingPathComponent("Documents/stickers"))
+        panel.directoryURL = libraryURL.deletingLastPathComponent()
         panel.prompt = "Use as Background"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         recordUndo()

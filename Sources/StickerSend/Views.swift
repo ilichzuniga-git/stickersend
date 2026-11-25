@@ -146,6 +146,11 @@ struct ContentView: View {
         }
         .onAppear { installKeyMonitor() }
         .onDisappear { removeKeyMonitor() }
+        .sheet(isPresented: $model.showWelcomeSetup) {
+            WelcomeSetupSheet()
+                .environmentObject(model)
+                .interactiveDismissDisabled(true)
+        }
     }
 
     private var printerDotColor: Color {
@@ -576,6 +581,80 @@ private struct CheckDetailRow: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+}
+
+// MARK: - First-Run Setup Sheet
+
+struct WelcomeSetupSheet: View {
+    @EnvironmentObject var model: AppModel
+
+    private var displayPath: String {
+        (model.libraryPath as NSString).abbreviatingWithTildeInPath
+    }
+
+    var body: some View {
+        VStack(spacing: 18) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(darkCheck)
+                    .frame(width: 64, height: 64)
+                Image(systemName: "folder.badge.plus")
+                    .font(.system(size: 28, weight: .medium))
+                    .foregroundStyle(.white)
+            }
+
+            VStack(spacing: 6) {
+                Text("Welcome to StickerSend")
+                    .font(.title2.weight(.semibold))
+                Text("Choose your default sticker folder. StickerSend loads PNG stickers from here and copies any files you drag into the app.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Default folder")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Image(systemName: "folder.fill")
+                        .foregroundStyle(Color.accentColor)
+                    Text(displayPath)
+                        .font(.callout.monospaced())
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.1), lineWidth: 1))
+            }
+
+            HStack(spacing: 10) {
+                Button("Use Default Folder") {
+                    model.completeSetup(useDefault: true)
+                }
+                .controlSize(.large)
+
+                Button {
+                    model.completeSetup(useDefault: false)
+                } label: {
+                    Label("Choose Sticker Folder…", systemImage: "folder")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+            }
+
+            Text("You can change this anytime from the bottom of the sidebar or with ⇧⌘O.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(26)
+        .frame(width: 440)
     }
 }
 
